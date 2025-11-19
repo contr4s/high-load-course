@@ -2,6 +2,8 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -21,6 +23,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    private val meterRegistry: MeterRegistry,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -32,9 +35,8 @@ class PaymentExternalSystemAdapterImpl(
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
-    private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
-    private val parallelRequests = properties.parallelRequests
+    private val parallelRequests = 15
 
     private val client = OkHttpClient.Builder().build()
 
@@ -45,12 +47,46 @@ class PaymentExternalSystemAdapterImpl(
 
     private val ongoingWindow = OngoingWindow(maxWinSize = parallelRequests)
 
+    private val expiredPaymentsCounter: Counter = Counter.builder("payment_expired_total")
+        .description("Total number of payments that expired before submission due to deadline")
+        .tag("account", accountName)
+        .register(meterRegistry)
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
+        val currentTime = now()
+        if (currentTime >= deadline) {
+            logger.error("[$accountName] Payment $paymentId expired before rate limiter (current: $currentTime, deadline: $deadline)")
+            expiredPaymentsCounter.increment()
+            
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
+            
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Payment expired before submission (deadline exceeded)")
+            }
+            return
+        }
 
         rateLimiter.tickBlocking()
+
+        // Проверяем deadline после ожидания в rate limiter
+        val afterRateLimiterTime = now()
+        if (afterRateLimiterTime >= deadline) {
+            expiredPaymentsCounter.increment()
+            
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
+            
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Payment expired after rate limiter wait (deadline exceeded)")
+            }
+            return
+        }
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
