@@ -16,7 +16,6 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import kotlin.math.ceil
 import kotlin.math.max
-import kotlin.math.min
 
 @Service
 class OrderPayer(
@@ -27,9 +26,7 @@ class OrderPayer(
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
-        private const val MIN_BUFFER_WINDOW_MILLIS = 250L
         private const val BURST_BUFFER_WINDOW_MILLIS = 3000L
-        private const val MAX_WORKER_POOL_SIZE = 128
     }
 
     private val enabledAccounts = paymentAccounts.filter { it.isEnabled() }
@@ -44,12 +41,9 @@ class OrderPayer(
         ?.sumOf { it.parallelRequests().coerceAtLeast(1) }
         ?: 1
 
-    private val workerParallelism = max(1, min(maxParallelRequests, MAX_WORKER_POOL_SIZE.coerceAtLeast(1)))
+    private val workerParallelism = max(1, maxParallelRequests)
 
-    private val bufferWindowSeconds = max(
-        (BURST_BUFFER_WINDOW_MILLIS.coerceAtLeast(MIN_BUFFER_WINDOW_MILLIS)).toDouble() / 1000.0,
-        MIN_BUFFER_WINDOW_MILLIS.toDouble() / 1000.0
-    )
+    private val bufferWindowSeconds = BURST_BUFFER_WINDOW_MILLIS.toDouble() / 1000.0
 
     private val drainRatePerSecond = effectiveRateLimitPerSecond.coerceAtLeast(1)
 
@@ -69,7 +63,7 @@ class OrderPayer(
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(queueCapacity),
         NamedThreadFactory("payment-submission-executor"),
-        CallerBlockingRejectedExecutionHandler(Duration.ofMillis(BURST_BUFFER_WINDOW_MILLIS.coerceAtLeast(MIN_BUFFER_WINDOW_MILLIS)))
+        CallerBlockingRejectedExecutionHandler(Duration.ofMillis(BURST_BUFFER_WINDOW_MILLIS))
     )
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
@@ -78,7 +72,7 @@ class OrderPayer(
         try {
             paymentExecutor.execute { handlePayment(task) }
             } catch (ex: RejectedExecutionException) {
-                val retryAfter = BURST_BUFFER_WINDOW_MILLIS.coerceAtLeast(MIN_BUFFER_WINDOW_MILLIS)
+                val retryAfter = BURST_BUFFER_WINDOW_MILLIS
                 logger.warn(
                     "Failed to enqueue payment {} for order {} due to saturated buffer, retry-after {} ms",
                     paymentId,
