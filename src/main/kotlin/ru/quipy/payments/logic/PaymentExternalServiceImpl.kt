@@ -148,6 +148,12 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
+    override fun rateLimitPerSecond() = properties.rateLimitPerSec
+
+    override fun parallelRequests() = properties.parallelRequests
+
+    override fun averageProcessingTime() = properties.averageProcessingTime
+
 }
 
 public fun now() = System.currentTimeMillis()
