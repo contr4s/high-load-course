@@ -5,7 +5,7 @@ import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.time.Duration
@@ -14,8 +14,8 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import kotlin.math.ceil
 import kotlin.math.max
+import kotlin.random.Random
 
 @Service
 class OrderPayer(
@@ -26,7 +26,8 @@ class OrderPayer(
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
-        private const val BURST_BUFFER_WINDOW_MILLIS = 3000L
+        private const val BASE_RETRY_AFTER_MILLIS = 1000L
+        private const val JITTER_FACTOR = 0.5
     }
 
     private val enabledAccounts = paymentAccounts.filter { it.isEnabled() }
@@ -43,18 +44,14 @@ class OrderPayer(
 
     private val workerParallelism = max(1, maxParallelRequests)
 
-    private val bufferWindowSeconds = BURST_BUFFER_WINDOW_MILLIS.toDouble() / 1000.0
-
-    private val drainRatePerSecond = effectiveRateLimitPerSecond.coerceAtLeast(1)
-
-    private val burstBufferCapacity = ceil(drainRatePerSecond * bufferWindowSeconds).toInt()
-
-    private val queueCapacity = max(1, burstBufferCapacity)
-
-    private val submissionRateLimiter = SlidingWindowRateLimiter(
-        rate = effectiveRateLimitPerSecond.coerceAtLeast(1).toLong(),
-        window = Duration.ofSeconds(1)
+    private val entryRateLimiter = TokenBucketRateLimiter(
+        rate = effectiveRateLimitPerSecond,
+        bucketMaxCapacity = effectiveRateLimitPerSecond * 2,
+        window = 1,
+        timeUnit = TimeUnit.SECONDS
     )
+
+    private val queueCapacity = maxParallelRequests * 2
 
     private val paymentExecutor = ThreadPoolExecutor(
         workerParallelism,
@@ -63,27 +60,60 @@ class OrderPayer(
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(queueCapacity),
         NamedThreadFactory("payment-submission-executor"),
-        CallerBlockingRejectedExecutionHandler(Duration.ofMillis(BURST_BUFFER_WINDOW_MILLIS))
+        CallerBlockingRejectedExecutionHandler(Duration.ofMillis(BASE_RETRY_AFTER_MILLIS))
     )
 
+    private fun calculateRetryAfter(deadline: Long): Long {
+        val now = System.currentTimeMillis()
+        val remainingTime = deadline - now
+
+        val baseRetry = remainingTime / 4
+        val jitter = 1.0 + Random.nextDouble() * JITTER_FACTOR
+        return (baseRetry * jitter).toLong().coerceAtLeast(BASE_RETRY_AFTER_MILLIS)
+    }
+
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+        val now = System.currentTimeMillis()
+        
+        if (now >= deadline) {
+            logger.warn("Payment {} for order {} already expired at entry (deadline={}, now={})", paymentId, orderId, deadline, now)
+            paymentESService.create { it.create(paymentId, orderId, amount) }
+            val transactionId = UUID.randomUUID()
+            paymentESService.update(paymentId) {
+                it.logSubmission(false, transactionId, now, Duration.ZERO)
+            }
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now, transactionId, reason = "Payment expired before processing (deadline exceeded at entry)")
+            }
+            return now
+        }
+        
+        if (!entryRateLimiter.tick()) {
+            val retryAfter = calculateRetryAfter(deadline)
+            logger.debug("Rate limit exceeded for payment {} order {}, returning 429 with retry-after {} ms", paymentId, orderId, retryAfter)
+            throw PaymentSubmissionThrottledException(
+                retryAfterMillis = retryAfter,
+                message = "Rate limit exceeded. Retry later.",
+            )
+        }
+
         val acceptedAt = System.currentTimeMillis()
         val task = PaymentTask(orderId, amount, paymentId, deadline, acceptedAt)
         try {
             paymentExecutor.execute { handlePayment(task) }
-            } catch (ex: RejectedExecutionException) {
-                val retryAfter = BURST_BUFFER_WINDOW_MILLIS
-                logger.warn(
-                    "Failed to enqueue payment {} for order {} due to saturated buffer, retry-after {} ms",
-                    paymentId,
-                    orderId,
-                    retryAfter,
-                )
-                throw PaymentSubmissionThrottledException(
-                    retryAfterMillis = retryAfter,
-                    message = "Payment submission buffer is saturated. Retry later.",
-                    cause = ex,
-                )
+        } catch (ex: RejectedExecutionException) {
+            val retryAfter = calculateRetryAfter(deadline)
+            logger.warn(
+                "Failed to enqueue payment {} for order {} due to saturated buffer, retry-after {} ms",
+                paymentId,
+                orderId,
+                retryAfter,
+            )
+            throw PaymentSubmissionThrottledException(
+                retryAfterMillis = retryAfter,
+                message = "Payment submission buffer is saturated. Retry later.",
+                cause = ex,
+            )
         }
         return acceptedAt
     }
@@ -94,15 +124,7 @@ class OrderPayer(
         }
         logger.trace("Payment ${createdEvent.paymentId} for order ${task.orderId} created.")
 
-        var now = System.currentTimeMillis()
-        if (now >= task.deadline) {
-            logExpiredInBuffer(task, now)
-            return
-        }
-
-        submissionRateLimiter.tickBlocking()
-
-        now = System.currentTimeMillis()
+        val now = System.currentTimeMillis()
         if (now >= task.deadline) {
             logExpiredInBuffer(task, now)
             return
