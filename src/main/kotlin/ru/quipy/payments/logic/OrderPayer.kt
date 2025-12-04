@@ -26,8 +26,10 @@ class OrderPayer(
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
-        private const val BASE_RETRY_AFTER_MILLIS = 1000L
-        private const val JITTER_FACTOR = 0.5
+        private const val BASE_RETRY_AFTER_MILLIS = 100L
+        private const val MAX_RETRY_AFTER_MILLIS = 500L
+        private const val JITTER_FACTOR = 0.3
+        private const val MIN_REMAINING_TIME_FOR_RETRY_MS = 1000L
     }
 
     private val enabledAccounts = paymentAccounts.filter { it.isEnabled() }
@@ -41,6 +43,12 @@ class OrderPayer(
         .takeIf { it.isNotEmpty() }
         ?.sumOf { it.parallelRequests().coerceAtLeast(1) }
         ?: 1
+
+    private val avgProcessingTimeMs = enabledAccounts
+        .takeIf { it.isNotEmpty() }
+        ?.map { it.averageProcessingTime().toMillis() }
+        ?.average()?.toLong()
+        ?: 1000L
 
     private val workerParallelism = max(1, maxParallelRequests)
 
@@ -66,10 +74,14 @@ class OrderPayer(
     private fun calculateRetryAfter(deadline: Long): Long {
         val now = System.currentTimeMillis()
         val remainingTime = deadline - now
+        
+        if (remainingTime <= avgProcessingTimeMs) {
+            return BASE_RETRY_AFTER_MILLIS
+        }
 
-        val baseRetry = remainingTime / 4
+        val baseRetry = (remainingTime - avgProcessingTimeMs) / 3
         val jitter = 1.0 + Random.nextDouble() * JITTER_FACTOR
-        return (baseRetry * jitter).toLong().coerceAtLeast(BASE_RETRY_AFTER_MILLIS)
+        return (baseRetry * jitter).toLong().coerceIn(BASE_RETRY_AFTER_MILLIS, MAX_RETRY_AFTER_MILLIS)
     }
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
@@ -89,6 +101,20 @@ class OrderPayer(
         }
         
         if (!entryRateLimiter.tick()) {
+            val remainingTime = deadline - System.currentTimeMillis()
+            if (remainingTime < MIN_REMAINING_TIME_FOR_RETRY_MS + avgProcessingTimeMs) {
+                logger.warn("Payment {} for order {} rejected: not enough time for retry (remaining={}ms)", paymentId, orderId, remainingTime)
+                paymentESService.create { it.create(paymentId, orderId, amount) }
+                val transactionId = UUID.randomUUID()
+                paymentESService.update(paymentId) {
+                    it.logSubmission(false, transactionId, System.currentTimeMillis(), Duration.ZERO)
+                }
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, System.currentTimeMillis(), transactionId, reason = "Payment rejected: not enough time remaining for retry")
+                }
+                return System.currentTimeMillis()
+            }
+            
             val retryAfter = calculateRetryAfter(deadline)
             logger.debug("Rate limit exceeded for payment {} order {}, returning 429 with retry-after {} ms", paymentId, orderId, retryAfter)
             throw PaymentSubmissionThrottledException(
@@ -102,6 +128,20 @@ class OrderPayer(
         try {
             paymentExecutor.execute { handlePayment(task) }
         } catch (ex: RejectedExecutionException) {
+            val remainingTime = deadline - System.currentTimeMillis()
+            if (remainingTime < MIN_REMAINING_TIME_FOR_RETRY_MS + avgProcessingTimeMs) {
+                logger.warn("Payment {} for order {} rejected on buffer overflow: not enough time for retry (remaining={}ms)", paymentId, orderId, remainingTime)
+                paymentESService.create { it.create(paymentId, orderId, amount) }
+                val transactionId = UUID.randomUUID()
+                paymentESService.update(paymentId) {
+                    it.logSubmission(false, transactionId, System.currentTimeMillis(), Duration.ZERO)
+                }
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, System.currentTimeMillis(), transactionId, reason = "Payment rejected on buffer overflow: not enough time remaining")
+                }
+                return System.currentTimeMillis()
+            }
+            
             val retryAfter = calculateRetryAfter(deadline)
             logger.warn(
                 "Failed to enqueue payment {} for order {} due to saturated buffer, retry-after {} ms",
