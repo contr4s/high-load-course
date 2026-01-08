@@ -5,6 +5,8 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
+import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -34,8 +36,21 @@ class PaymentExternalSystemAdapterImpl(
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
 
-        const val REQUEST_TIMEOUT_MS = 1000L
-        const val MAX_RETRIES = 5
+        const val REQUEST_TIMEOUT_MS = 12_000L
+        const val MAX_RETRIES = 4
+        const val MAX_CONNECTIONS = 10000
+        const val MIN_TIME_FOR_RETRY = 1000
+
+        private val sharedConnectionPool = ConnectionPool(
+            maxIdleConnections = 500,
+            keepAliveDuration = 5,
+            timeUnit = TimeUnit.MINUTES
+        )
+        
+        private val sharedDispatcher = Dispatcher().apply {
+            maxRequests = MAX_CONNECTIONS
+            maxRequestsPerHost = MAX_CONNECTIONS
+        }
     }
 
     private val serviceName = properties.serviceName
@@ -44,10 +59,13 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(1, TimeUnit.SECONDS)
+        .connectionPool(sharedConnectionPool)
+        .dispatcher(sharedDispatcher)
+        .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-        .writeTimeout(REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-        .callTimeout(REQUEST_TIMEOUT_MS + 500, TimeUnit.MILLISECONDS)
+        .writeTimeout(5, TimeUnit.SECONDS)
+        .callTimeout(REQUEST_TIMEOUT_MS + 2_000, TimeUnit.MILLISECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     private val rateLimiter = SlidingWindowRateLimiter(
@@ -123,7 +141,16 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         ongoingWindow.acquire()
-        
+
+        val afterWindowTime = now()
+        if (afterWindowTime >= deadline) {
+            ongoingWindow.release()
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Payment expired while waiting in ongoing window")
+            }
+            return
+        }
+
         try {
             executeWithRetry(paymentId, transactionId, amount, deadline)
         } finally {
@@ -137,7 +164,8 @@ class PaymentExternalSystemAdapterImpl(
         while (retryCount <= MAX_RETRIES) {
             val currentTime = now()
             val timeRemaining = deadline - currentTime
-            if (timeRemaining < REQUEST_TIMEOUT_MS / 2) {
+            
+            if (timeRemaining < MIN_TIME_FOR_RETRY) {
                 logger.warn("[$accountName] Not enough time for retry, remaining: ${timeRemaining}ms, payment: $paymentId")
                 if (retryCount != 0) {
                     paymentESService.update(paymentId) {
@@ -178,31 +206,35 @@ class PaymentExternalSystemAdapterImpl(
                 val requestDuration = now() - requestStartTime
                 requestLatencyTimer.record(requestDuration, TimeUnit.MILLISECONDS)
                 
-                when (e) {
-                    is SocketTimeoutException -> {
-                        timeoutCounter.increment()
-                        logger.error("[$accountName] Payment timeout (attempt ${retryCount + 1}) for txId: $transactionId, payment: $paymentId", e)
-                        
-                        if (retryCount < MAX_RETRIES && now() + REQUEST_TIMEOUT_MS < deadline) {
-                            retryCount++
-                            retriesCounter.increment()
-                            logger.info("[$accountName] Retrying payment (attempt ${retryCount + 1}) for txId: $transactionId, payment: $paymentId")
-                            continue
-                        }
-                        
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = "Request timeout after ${retryCount + 1} attempts.")
-                        }
-                        return
+                val isRetryableError = e is SocketTimeoutException ||
+                    e is java.io.InterruptedIOException ||
+                    e is java.net.SocketException ||
+                    e is java.net.BindException ||
+                    e.cause is java.net.SocketException ||
+                    e.cause is java.net.BindException
+                
+                if (isRetryableError) {
+                    timeoutCounter.increment()
+                    logger.warn("[$accountName] Retryable error (attempt ${retryCount + 1}) for txId: $transactionId, payment: $paymentId: ${e.javaClass.simpleName}: ${e.message}")
+                    
+                    if (retryCount < MAX_RETRIES && now() + REQUEST_TIMEOUT_MS < deadline) {
+                        retryCount++
+                        retriesCounter.increment()
+                        Thread.sleep(50)
+                        logger.info("[$accountName] Retrying payment (attempt ${retryCount + 1}) for txId: $transactionId, payment: $paymentId")
+                        continue
                     }
-
-                    else -> {
-                        logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = e.message)
-                        }
-                        return
+                    
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Connection error after ${retryCount + 1} attempts: ${e.message}")
                     }
+                    return
+                } else {
+                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = e.message)
+                    }
+                    return
                 }
             }
         }

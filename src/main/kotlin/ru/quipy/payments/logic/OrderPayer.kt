@@ -26,9 +26,10 @@ class OrderPayer(
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
-        private const val BASE_RETRY_AFTER_MILLIS = 50L
-        private const val MAX_RETRY_AFTER_MILLIS = 200L
+        private const val BASE_RETRY_AFTER_MILLIS = 20L
+        private const val MAX_RETRY_AFTER_MILLIS = 100L
         private const val JITTER_FACTOR = 0.2
+        private const val MAX_WORKERS = 5000
     }
 
     private val enabledAccounts = paymentAccounts.filter { it.isEnabled() }
@@ -49,7 +50,7 @@ class OrderPayer(
         ?.average()?.toLong()
         ?: 1000L
 
-    private val workerParallelism = max(1, maxParallelRequests)
+    private val workerParallelism = max(1, minOf(maxParallelRequests, MAX_WORKERS))
 
     private val entryRateLimiter = TokenBucketRateLimiter(
         rate = effectiveRateLimitPerSecond,
@@ -58,13 +59,13 @@ class OrderPayer(
         timeUnit = TimeUnit.SECONDS
     )
 
-    private val queueCapacity = maxParallelRequests * 2
+    private val queueCapacity = workerParallelism * 2
 
     private val paymentExecutor = ThreadPoolExecutor(
         workerParallelism,
         workerParallelism,
-        0L,
-        TimeUnit.MILLISECONDS,
+        60L,
+        TimeUnit.SECONDS,
         LinkedBlockingQueue(queueCapacity),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler(Duration.ofMillis(BASE_RETRY_AFTER_MILLIS))
