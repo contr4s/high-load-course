@@ -24,6 +24,12 @@ interface PaymentExternalSystemAdapter {
     fun price(): Int
 
     fun isEnabled(): Boolean
+
+    fun rateLimitPerSecond(): Int
+
+    fun parallelRequests(): Int
+
+    fun averageProcessingTime(): Duration
 }
 
 /**

@@ -36,7 +36,7 @@ class PaymentExternalSystemAdapterImpl(
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val rateLimitPerSec = properties.rateLimitPerSec
-    private val parallelRequests = 15
+    private val parallelRequests = properties.parallelRequests
 
     private val client = OkHttpClient.Builder().build()
 
@@ -147,6 +147,12 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
+
+    override fun rateLimitPerSecond() = properties.rateLimitPerSec
+
+    override fun parallelRequests() = properties.parallelRequests
+
+    override fun averageProcessingTime() = properties.averageProcessingTime
 
 }
 
