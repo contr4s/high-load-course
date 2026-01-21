@@ -26,10 +26,9 @@ class OrderPayer(
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
-        private const val BASE_RETRY_AFTER_MILLIS = 100L
-        private const val MAX_RETRY_AFTER_MILLIS = 500L
-        private const val JITTER_FACTOR = 0.3
-        private const val MIN_REMAINING_TIME_FOR_RETRY_MS = 1000L
+        private const val BASE_RETRY_AFTER_MILLIS = 50L
+        private const val MAX_RETRY_AFTER_MILLIS = 200L
+        private const val JITTER_FACTOR = 0.2
     }
 
     private val enabledAccounts = paymentAccounts.filter { it.isEnabled() }
@@ -102,7 +101,7 @@ class OrderPayer(
         
         if (!entryRateLimiter.tick()) {
             val remainingTime = deadline - System.currentTimeMillis()
-            if (remainingTime < MIN_REMAINING_TIME_FOR_RETRY_MS + avgProcessingTimeMs) {
+            if (remainingTime < avgProcessingTimeMs / 2) {
                 logger.warn("Payment {} for order {} rejected: not enough time for retry (remaining={}ms)", paymentId, orderId, remainingTime)
                 paymentESService.create { it.create(paymentId, orderId, amount) }
                 val transactionId = UUID.randomUUID()
@@ -129,7 +128,7 @@ class OrderPayer(
             paymentExecutor.execute { handlePayment(task) }
         } catch (ex: RejectedExecutionException) {
             val remainingTime = deadline - System.currentTimeMillis()
-            if (remainingTime < MIN_REMAINING_TIME_FOR_RETRY_MS + avgProcessingTimeMs) {
+            if (remainingTime < avgProcessingTimeMs / 2) {
                 logger.warn("Payment {} for order {} rejected on buffer overflow: not enough time for retry (remaining={}ms)", paymentId, orderId, remainingTime)
                 paymentESService.create { it.create(paymentId, orderId, amount) }
                 val transactionId = UUID.randomUUID()
