@@ -13,6 +13,28 @@ import java.util.concurrent.atomic.AtomicInteger
 
 interface RateLimiter {
     fun tick(): Boolean
+
+    suspend fun tickWithTimeout(timeout: Long, timeUnit: TimeUnit): Boolean {
+        val timeoutMs = timeUnit.toMillis(timeout)
+        val startTime = System.currentTimeMillis()
+        
+        while (true) {
+            if (tick()) {
+                return true
+            }
+            
+            val elapsed = System.currentTimeMillis() - startTime
+            if (elapsed >= timeoutMs) {
+                return false
+            }
+            
+            val remainingTime = timeoutMs - elapsed
+            val waitTime = minOf(10L, remainingTime)
+            if (waitTime > 0) {
+                delay(waitTime)
+            }
+        }
+    }
 }
 
 class FixedWindowRateLimiter(
