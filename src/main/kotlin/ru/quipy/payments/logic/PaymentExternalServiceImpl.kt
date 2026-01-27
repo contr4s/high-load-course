@@ -43,11 +43,11 @@ class PaymentExternalSystemAdapterImpl(
 
         private val httpClient: HttpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
-            .executor(Executors.newVirtualThreadPerTaskExecutor())
+            .executor(Executors.newFixedThreadPool(100))
             .build()
         
         private val paymentScope = CoroutineScope(
-            Executors.newVirtualThreadPerTaskExecutor().asCoroutineDispatcher() + SupervisorJob()
+            Executors.newFixedThreadPool(100).asCoroutineDispatcher() + SupervisorJob()
         )
     }
 
